@@ -82,6 +82,9 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df["log_ornaments"] = np.log1p(df["ornaments_weight_kg"])
     df["log_tree_height"] = np.log1p(df["tree_height_cm"])
     df["garland_led_interaction"] = df["garland_hours_per_day"].fillna(0) * (1 + df["led_garland"].fillna(0))
+    df["humidity_deficit"] = 100.0 - df["humidity_pct"]
+    df["temp_x_humidity_deficit"] = df["room_temp_c"] * df["humidity_deficit"]
+    df["heat_risk_per_area"] = df["heat_risk"] / (df["apartment_area_m2"] + 10.0)
 
     return df
 
@@ -104,6 +107,16 @@ def main() -> None:
         if X[col].dtype == "object"
         or str(X[col].dtype).startswith("category")
     ]
+
+    def rank01(values: np.ndarray) -> np.ndarray:
+        return pd.Series(values).rank(method="average").values / (len(values) + 1.0)
+
+    def logit(values: np.ndarray) -> np.ndarray:
+        values = np.clip(values, 1e-6, 1 - 1e-6)
+        return np.log(values / (1 - values))
+
+    def sigmoid(values: np.ndarray) -> np.ndarray:
+        return 1.0 / (1.0 + np.exp(-values))
 
     model_params = [
         dict(
@@ -138,6 +151,7 @@ def main() -> None:
             early_stopping_rounds=100,
             boosting_type="Plain",
             auto_class_weights="Balanced",
+            one_hot_max_size=20,
         ),
         dict(
             loss_function="Logloss",
@@ -157,6 +171,7 @@ def main() -> None:
             early_stopping_rounds=100,
             boosting_type="Ordered",
             auto_class_weights="Balanced",
+            border_count=128,
         ),
     ]
 
@@ -196,14 +211,63 @@ def main() -> None:
         oof_list.append(model_oof)
         test_list.append(model_test)
 
-    weights = np.array(model_weights)
-    weights = weights / weights.sum()
-    for weight, model_oof, model_test in zip(weights, oof_list, test_list):
-        oof += model_oof * weight
-        test_pred += model_test * weight
-    oof_auc = roc_auc_score(y, oof)
-    print(f"Итоговый OOF ROC-AUC (взвешенное среднее): {oof_auc:.6f}")
-    preds = test_pred
+    def blend_for_indices(indices: list[int]) -> tuple[str, float, np.ndarray]:
+        weights_local = np.array([model_weights[i] for i in indices])
+        weights_local = weights_local / weights_local.sum()
+
+        weighted_oof = np.zeros(len(X))
+        weighted_test = np.zeros(len(test_fe))
+        rank_oof = np.zeros(len(X))
+        rank_test = np.zeros(len(test_fe))
+        logit_oof = np.zeros(len(X))
+        logit_test = np.zeros(len(test_fe))
+
+        for weight, idx in zip(weights_local, indices):
+            model_oof = oof_list[idx]
+            model_test = test_list[idx]
+            weighted_oof += model_oof * weight
+            weighted_test += model_test * weight
+            rank_oof += rank01(model_oof) * weight
+            rank_test += rank01(model_test) * weight
+            logit_oof += logit(model_oof) * weight
+            logit_test += logit(model_test) * weight
+
+        weighted_auc = roc_auc_score(y, weighted_oof)
+        rank_auc = roc_auc_score(y, rank_oof)
+        logit_auc = roc_auc_score(y, sigmoid(logit_oof))
+
+        best_mode = "weighted"
+        best_auc = weighted_auc
+        preds_local = weighted_test
+        if rank_auc > best_auc:
+            best_mode = "rank"
+            best_auc = rank_auc
+            preds_local = rank_test
+        if logit_auc > best_auc:
+            best_mode = "logit"
+            best_auc = logit_auc
+            preds_local = sigmoid(logit_test)
+
+        print(
+            "Ансамбль индексов "
+            f"{indices}: weighted={weighted_auc:.6f}, rank={rank_auc:.6f}, "
+            f"logit={logit_auc:.6f} -> best={best_mode} ({best_auc:.6f})"
+        )
+        return best_mode, best_auc, preds_local
+
+    full_indices = list(range(len(model_params)))
+    _, best_full_auc, preds_full = blend_for_indices(full_indices)
+
+    top_k = 2
+    top_indices = np.argsort(model_weights)[-top_k:][::-1].tolist()
+    _, best_top_auc, preds_top = blend_for_indices(top_indices)
+
+    if best_top_auc >= best_full_auc:
+        preds = preds_top
+        print(f"Итоговый выбор: топ-{top_k} модели (OOF {best_top_auc:.6f}).")
+    else:
+        preds = preds_full
+        print(f"Итоговый выбор: все модели (OOF {best_full_auc:.6f}).")
 
     submission = pd.read_csv(SAMPLE_SUB_PATH)
     submission[target_col] = preds
